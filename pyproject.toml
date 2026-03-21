@@ -10,3 +10,8 @@ dependencies = [
     "psycopg2-binary>=2.9.11",
     "streamlit>=1.55.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pgcli>=4.4.0",
+]
