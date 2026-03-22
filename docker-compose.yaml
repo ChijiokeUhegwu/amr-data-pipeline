@@ -1,0 +1,53 @@
+services:
+  db:
+    image: postgres:18
+    container_name: amr_postgres
+    environment:
+      POSTGRES_USER: amr_user
+      POSTGRES_PASSWORD: amr_password
+      POSTGRES_DB: amr_db
+    volumes:
+      - amr_data:/var/lib/postgresql
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - amr-network
+
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: amr@admin.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "8085:80"
+    depends_on:
+      - db
+    networks:
+      - amr-network
+
+  ingest:
+    image: ingest_data:v001
+    container_name: ingest_pipeline
+    depends_on:
+      - db
+    environment:
+      DB_HOST: amr_postgres
+      DB_PORT: 5432
+      DB_NAME: amr_db
+      DB_USER: amr_user
+      DB_PASSWORD: amr_password
+      GOOGLE_APPLICATION_CREDENTIALS: /home/vscode/.config/gcloud/application_default_credentials.json
+      GOOGLE_CLOUD_PROJECT: amr-data-pipeline   
+    volumes:
+      - /home/vscode/.config/gcloud:/home/vscode/.config/gcloud:ro
+    networks:
+      - amr-network
+
+volumes:
+  amr_data:
+
+networks:
+  amr-network:
+    driver: bridge

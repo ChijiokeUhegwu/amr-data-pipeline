@@ -8,7 +8,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/
 WORKDIR /app
 
 # Add virtual environment to PATH so we can use installed packages
-ENV PATH="/code/.venv/bin:$PATH"
+ENV PATH="/app/.venv/bin:$PATH"
 
 # Copy dependency files first (better layer caching)
 COPY "pyproject.toml" "uv.lock" ".python-version" ./
@@ -22,5 +22,4 @@ COPY ingestion/transform.py   .
 COPY ingestion/load_to_db.py  .
 
 # Default entrypoint runs the full pipeline.
-# Kestra can override this per task.
 ENTRYPOINT ["python", "load_to_db.py"]
