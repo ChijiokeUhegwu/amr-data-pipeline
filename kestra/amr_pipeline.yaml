@@ -1,0 +1,148 @@
+# Kestra Flow: AMR Surveillance Pipeline
+# Namespace: genomics.amr
+#
+# What this flow does every Monday at 02:00 UTC:
+#   1. Run the ingestion Docker container (fetch → transform → load)
+#   2. Query PostgreSQL to verify rows were loaded
+#   3. Warn if the count looks suspiciously low
+#   4. Update the pipeline_runs table on failure
+
+
+id: amr_surveillance_pipeline
+namespace: genomics.amr
+
+description: |
+  Weekly pipeline: fetches AMR + metadata TSVs from NCBI Pathogen Detection,
+  uploads raw copies to GCS, transforms and joins them, then loads into
+  PostgreSQL and refreshes the amr_summary table for the Streamlit dashboard.
+
+# Schedule 
+triggers:
+  - id: weekly_monday
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 2 * * 1"
+    timezone: UTC
+
+# ── Inputs (overrideable per manual execution) 
+inputs:
+  - id: organism
+    type: STRING
+    defaults: Pseudomonas_aeruginosa
+
+  - id: gcs_bucket
+    type: STRING
+    defaults: amr-data-pipeline
+
+# ── Variables 
+variables:
+  run_ts:  "{{ now() | date('yyyyMMdd_HHmmss') }}"
+  db_host: amr_postgres
+  db_pass: amr_password
+
+# ── Tasks 
+tasks:
+
+  - id: log_start
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      AMR pipeline starting
+        Organism : {{ inputs.organism }}
+        Run TS   : {{ vars.run_ts }}
+        Bucket   : {{ inputs.gcs_bucket }}
+
+  # ── Run the full ingestion container 
+  # The container runs load_to_db.py which internally calls:
+  #   fetch_amr.py  (FTP download + GCS upload)
+  #   transform.py  (join + clean)
+  #   load_to_db.py (upsert + refresh summary)
+  - id: run_pipeline
+    type: io.kestra.plugin.docker.Run
+    containerImage: ingest_data:v001
+    pullPolicy: NEVER          
+    networkMode: amr-data-pipeline_amr-network
+
+    env:
+      ORGANISM:    "{{ inputs.organism }}"
+      GCS_BUCKET:  "{{ inputs.gcs_bucket }}"
+      RUN_ID: "{{ vars.run_ts }}"
+      DB_HOST:     "{{ vars.db_host }}"
+      DB_PORT:     "5432"
+      DB_NAME:     amr_db
+      DB_USER:     amr_user
+      DB_PASSWORD: "{{ vars.db_pass }}"
+      GOOGLE_APPLICATION_CREDENTIALS: /home/kestra/.config/gcloud/application_default_credentials.json
+      GOOGLE_CLOUD_PROJECT: amr-data-pipeline
+
+    volumes:
+      - /home/vscode/.config/gcloud:/home/kestra/.config/gcloud:ro
+      
+    timeout: PT1H
+
+    retry:
+      type: constant
+      interval: PT5M
+      maxAttempt: 3
+
+  # did rows actually land? 
+  - id: verify_load
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    url: "jdbc:postgresql://{{ vars.db_host }}:5432/amr_db"
+    username: amr_user
+    password: "{{ vars.db_pass }}"
+    sql: |
+      SELECT
+        pr.run_id,
+        pr.status,
+        pr.records_loaded AS isolates_loaded,
+        COUNT(ag.id) AS genes_loaded,
+        COUNT(DISTINCT im.country) AS countries,
+        MAX(im.inserted_at)::TEXT AS latest_insert
+      FROM pipeline_runs pr
+      LEFT JOIN isolate_metadata im ON im.run_id = pr.run_id
+      LEFT JOIN amr_genes ag ON ag.biosample_acc = im.biosample_acc
+      WHERE pr.run_id = '{{ vars.run_ts }}'
+      GROUP BY pr.run_id, pr.status, pr.records_loaded;
+    fetchType: FETCH
+
+  - id: log_verification
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      Verification result:
+      {{ outputs.verify_load.rows | toPrettyJson }}
+
+  # warn if too few isolates loaded 
+  - id: check_count
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.verify_load.rows | first | get('isolates_loaded') | int < 100 }}"
+    then:
+      - id: warn_low_count
+        type: io.kestra.plugin.core.log.Log
+        level: WARN
+        message: |
+          Only {{ outputs.verify_load.rows | first | get('isolates_loaded') }} isolates loaded.
+          Check NCBI FTP availability and the pipeline_runs table for errors.
+
+  - id: log_success
+    type: io.kestra.plugin.core.log.Log
+    message: "Pipeline complete for {{ inputs.organism }} — run_ts: {{ vars.run_ts }}"
+
+# ── Error handler 
+errors:
+  - id: log_failure
+    type: io.kestra.plugin.core.log.Log
+    level: ERROR
+    message: |
+      PIPELINE FAILED at task: {{ task.id }}
+      {{ errorLogs() }}
+
+  - id: mark_failed_in_db
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    url: "jdbc:postgresql://{{ vars.db_host }}:5432/amr_db"
+    username: amr_user
+    password: "{{ vars.db_pass }}"
+    sql: |
+      UPDATE pipeline_runs
+      SET status = 'failed',
+          notes  = 'Kestra execution error — check Kestra UI logs'
+      WHERE run_id = '{{ vars.run_ts }}';
+

@@ -45,6 +45,7 @@ DB_CONFIG = {
 }
 
 ORGANISM = os.getenv("ORGANISM", "Pseudomonas_aeruginosa")
+RUN_ID = os.getenv("RUN_ID")  # Passed from Kestra
 
 
 # ── Connection ─────────────────────────────────────────────────────────────
@@ -55,14 +56,15 @@ def get_conn():
 
 # ── Pipeline run tracking ──────────────────────────────────────────────────
 
-def start_run(conn, organism: str, n_fetched: int) -> int:
+def start_run(conn, organism: str, n_fetched: int, run_id: str) -> int:
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO pipeline_runs (organism, records_fetched, status)
-            VALUES (%s, %s, 'running') RETURNING run_id
+            VALUES (%s, %s, 'running') 
+            ON CONFLICT (run_id) DO NOTHING
             """,
-            (organism, n_fetched),
+            (run_id, organism, n_fetched),
         )
         run_id = cur.fetchone()[0]
     conn.commit()
@@ -70,7 +72,7 @@ def start_run(conn, organism: str, n_fetched: int) -> int:
     return run_id
 
 
-def finish_run(conn, run_id: int, n_loaded: int, status="success", notes=""):
+def finish_run(conn, run_id: str, n_loaded: int, status="success", notes=""):
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -219,7 +221,15 @@ def main():
     log.info("Connected to PostgreSQL at %s/%s", DB_CONFIG["host"], DB_CONFIG["dbname"])
 
     # Step 3 — Open run record
-    run_id = start_run(conn, ORGANISM.replace("_", " "), len(isolates_df))
+    if not RUN_ID:
+    # Fallback (only if running outside Kestra)
+        RUN_ID_LOCAL = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+        log.warning("RUN_ID not provided — using generated value: %s", RUN_ID_LOCAL)
+        run_id = RUN_ID_LOCAL
+    else:
+        run_id = RUN_ID
+
+    run_id = start_run(conn, ORGANISM.replace("_", " "), len(isolates_df), run_id)
 
     try:
         n_iso   = upsert_isolates(conn, isolates_df, run_id)
@@ -234,7 +244,7 @@ def main():
         raise
 
     conn.close()
-    log.info("=== AMR Load Pipeline complete ===")
+    log.info("=== AMR Load Pipeline starting (run_id=%s) ===", RUN_ID)
     return {"run_id": run_id, "isolates_loaded": n_iso, "genes_loaded": n_genes}
 
 

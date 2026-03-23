@@ -22,4 +22,4 @@ COPY ingestion/transform.py   .
 COPY ingestion/load_to_db.py  .
 
 # Default entrypoint runs the full pipeline.
-ENTRYPOINT ["python", "load_to_db.py"]
+ENTRYPOINT ["python", "/app/load_to_db.py"]
